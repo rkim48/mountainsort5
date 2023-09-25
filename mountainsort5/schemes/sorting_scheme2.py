@@ -12,14 +12,83 @@ from ..core.SnippetClassifier import SnippetClassifier
 from ..core.remove_duplicate_events import remove_duplicate_events
 from ..core.get_sampled_recording_for_training import get_sampled_recording_for_training
 from ..core.get_times_labels_from_sorting import get_times_labels_from_sorting
+from multiprocessing import Pool
+import os
 
+num_cores = os.cpu_count() - 2
+num_cores = 1
+
+def process_chunk(args):
+        chunk, recording, sampling_frequency, M, sorting_parameters, channel_locations, channel_masks, snippet_classifiers, reference_snippet_classifiers = args
+        traces_chunk = recording.get_traces(start_frame=chunk.start - chunk.padding_left, end_frame=chunk.end + chunk.padding_right)
+        print('Detecting spikes')
+        time_radius = int(math.ceil(sorting_parameters.detect_time_radius_msec / 1000 * sampling_frequency))
+        times_chunk, channel_indices_chunk = detect_spikes(
+            traces=traces_chunk,
+            channel_locations=channel_locations,
+            time_radius=time_radius,
+            channel_radius=sorting_parameters.detect_channel_radius,
+            detect_threshold=sorting_parameters.detect_threshold,
+            detect_sign=sorting_parameters.detect_sign,
+            margin_left=sorting_parameters.snippet_T1,
+            margin_right=sorting_parameters.snippet_T2,
+            verbose=False
+        )
+
+        print('Extracting and classifying snippets')
+        labels_chunk = np.zeros(len(times_chunk), dtype='int32')
+        labels_reference_chunk = np.zeros(len(times_chunk), dtype='int32') if reference_snippet_classifiers is not None else None
+        for m in range(M):
+            inds = np.where(channel_indices_chunk == m)[0]
+            if len(inds) > 0:
+                snippets2 = extract_snippets_in_channel_neighborhood(
+                    traces=traces_chunk,
+                    times=times_chunk[inds],
+                    neighborhood=channel_masks[m],
+                    T1=sorting_parameters.snippet_T1,
+                    T2=sorting_parameters.snippet_T2
+                )
+                labels_chunk_m, offsets_chunk_m = snippet_classifiers[m].classify_snippets(snippets2)
+                if labels_chunk_m is not None:
+                    labels_chunk[inds] = labels_chunk_m
+                    times_chunk[inds] = times_chunk[inds] - offsets_chunk_m
+                if reference_snippet_classifiers is not None:
+                    labels_reference_chunk_m, _ = reference_snippet_classifiers[m].classify_snippets(snippets2)
+                    if labels_reference_chunk_m is not None:
+                        labels_reference_chunk[inds] = labels_reference_chunk_m
+
+        # remove events with label 0
+        valid_inds = np.where(labels_chunk > 0)[0]
+        times_chunk: npt.NDArray[np.int32] = times_chunk[valid_inds]
+        labels_chunk: npt.NDArray[np.int32] = labels_chunk[valid_inds]
+        labels_reference_chunk = labels_reference_chunk[valid_inds] if reference_snippet_classifiers is not None else None
+
+        # now that we offset them we need to re-sort
+        sort_inds2 = np.argsort(times_chunk)
+        times_chunk: npt.NDArray[np.int32] = times_chunk[sort_inds2]
+        labels_chunk: npt.NDArray[np.int32] = labels_chunk[sort_inds2]
+        labels_reference_chunk = labels_reference_chunk[sort_inds2] if reference_snippet_classifiers is not None else None
+
+        print('Removing duplicates')
+        new_inds = remove_duplicate_events(times_chunk, labels_chunk, tol=time_radius)
+        times_chunk: npt.NDArray[np.int32] = times_chunk[new_inds]
+        labels_chunk: npt.NDArray[np.int32] = labels_chunk[new_inds]
+        labels_reference_chunk = labels_reference_chunk[new_inds] if reference_snippet_classifiers is not None else None
+
+        # remove events in the margins
+        valid_inds = np.where((chunk.padding_left <= times_chunk) & (times_chunk < chunk.total_size - chunk.padding_right))[0]
+        times_chunk: npt.NDArray[np.int32] = times_chunk[valid_inds]
+        labels_chunk: npt.NDArray[np.int32] = labels_chunk[valid_inds]
+        labels_reference_chunk = labels_reference_chunk[valid_inds] if reference_snippet_classifiers is not None else None
+        return times_chunk, labels_chunk, labels_reference_chunk, chunk.start, chunk.padding_left
 
 def sorting_scheme2(
     recording: si.BaseRecording, *,
     sorting_parameters: Scheme2SortingParameters,
     return_snippet_classifiers: bool = False, # used in scheme 3
     reference_snippet_classifiers: Union[Dict[int, SnippetClassifier], None] = None, # used in scheme 3
-    label_offset: int = 0 # used in scheme 3
+    label_offset: int = 0, # used in scheme 3
+    num_cores: int = None
 ) -> Union[si.BaseSorting, Tuple[si.BaseSorting, Dict[int, SnippetClassifier]]]:
     """MountainSort 5 sorting scheme 2
 
@@ -175,77 +244,20 @@ def sorting_scheme2(
     times_list: list[npt.NDArray[np.int64]] = []
     labels_list: list[npt.NDArray[np.int32]] = []
     labels_reference_list = [] if reference_snippet_classifiers is not None else None
-    for i, chunk in enumerate(chunks):
-        print(f'Time chunk {i + 1} of {len(chunks)}')
-        print('Loading traces')
-        traces_chunk = recording.get_traces(start_frame=chunk.start - chunk.padding_left, end_frame=chunk.end + chunk.padding_right)
-        print('Detecting spikes')
-        time_radius = int(math.ceil(sorting_parameters.detect_time_radius_msec / 1000 * sampling_frequency))
-        times_chunk, channel_indices_chunk = detect_spikes(
-            traces=traces_chunk,
-            channel_locations=channel_locations,
-            time_radius=time_radius,
-            channel_radius=sorting_parameters.detect_channel_radius,
-            detect_threshold=sorting_parameters.detect_threshold,
-            detect_sign=sorting_parameters.detect_sign,
-            margin_left=sorting_parameters.snippet_T1,
-            margin_right=sorting_parameters.snippet_T2,
-            verbose=False
-        )
 
-        print('Extracting and classifying snippets')
-        labels_chunk = np.zeros(len(times_chunk), dtype='int32')
-        labels_reference_chunk = np.zeros(len(times_chunk), dtype='int32') if reference_snippet_classifiers is not None else None
-        for m in range(M):
-            inds = np.where(channel_indices_chunk == m)[0]
-            if len(inds) > 0:
-                snippets2 = extract_snippets_in_channel_neighborhood(
-                    traces=traces_chunk,
-                    times=times_chunk[inds],
-                    neighborhood=channel_masks[m],
-                    T1=sorting_parameters.snippet_T1,
-                    T2=sorting_parameters.snippet_T2
-                )
-                labels_chunk_m, offsets_chunk_m = snippet_classifiers[m].classify_snippets(snippets2)
-                if labels_chunk_m is not None:
-                    labels_chunk[inds] = labels_chunk_m
-                    times_chunk[inds] = times_chunk[inds] - offsets_chunk_m
-                if reference_snippet_classifiers is not None:
-                    labels_reference_chunk_m, _ = reference_snippet_classifiers[m].classify_snippets(snippets2)
-                    if labels_reference_chunk_m is not None:
-                        labels_reference_chunk[inds] = labels_reference_chunk_m
+    args_list = [(chunk, recording, sampling_frequency, M, sorting_parameters, channel_locations, channel_masks, snippet_classifiers, reference_snippet_classifiers) for chunk in chunks]
 
-        # remove events with label 0
-        valid_inds = np.where(labels_chunk > 0)[0]
-        times_chunk: npt.NDArray[np.int32] = times_chunk[valid_inds]
-        labels_chunk: npt.NDArray[np.int32] = labels_chunk[valid_inds]
-        labels_reference_chunk = labels_reference_chunk[valid_inds] if reference_snippet_classifiers is not None else None
+    with Pool(processes=num_cores) as pool:
+        results = pool.map(process_chunk, args_list)
 
-        # now that we offset them we need to re-sort
-        sort_inds2 = np.argsort(times_chunk)
-        times_chunk: npt.NDArray[np.int32] = times_chunk[sort_inds2]
-        labels_chunk: npt.NDArray[np.int32] = labels_chunk[sort_inds2]
-        labels_reference_chunk = labels_reference_chunk[sort_inds2] if reference_snippet_classifiers is not None else None
-
-        print('Removing duplicates')
-        new_inds = remove_duplicate_events(times_chunk, labels_chunk, tol=time_radius)
-        times_chunk: npt.NDArray[np.int32] = times_chunk[new_inds]
-        labels_chunk: npt.NDArray[np.int32] = labels_chunk[new_inds]
-        labels_reference_chunk = labels_reference_chunk[new_inds] if reference_snippet_classifiers is not None else None
-
-        # remove events in the margins
-        valid_inds = np.where((chunk.padding_left <= times_chunk) & (times_chunk < chunk.total_size - chunk.padding_right))[0]
-        times_chunk: npt.NDArray[np.int32] = times_chunk[valid_inds]
-        labels_chunk: npt.NDArray[np.int32] = labels_chunk[valid_inds]
-        labels_reference_chunk = labels_reference_chunk[valid_inds] if reference_snippet_classifiers is not None else None
-
-        # don't forget to cast to int64 add the chunk start time
-        times_list.append(
-            times_chunk.astype(np.int64) + chunk.start - chunk.padding_left
-        )
+    # don't forget to cast to int64 add the chunk start time
+    # Process the results
+    for times_chunk, labels_chunk, labels_reference_chunk, chunk_start, chunk_padding_left in results:
+        times_list.append(times_chunk.astype(np.int64) + chunk_start - chunk_padding_left)
         labels_list.append(labels_chunk)
         if reference_snippet_classifiers is not None:
             labels_reference_list.append(labels_reference_chunk)
+        
 
     # Now concatenate the results
     times_concat: npt.NDArray[np.int64] = np.concatenate(times_list)

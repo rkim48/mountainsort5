@@ -5,11 +5,14 @@ import spikeinterface.extractors as se
 import spikeinterface.preprocessing as spre
 import spikeinterface.comparison as sc
 import mountainsort5 as ms5
+print(ms5.__file__)
 from generate_visualization_output import generate_visualization_output
 from spikeforest.load_spikeforest_recordings.SFRecording import SFRecording
 import spikeinterface as si
+import numpy as np
+import matplotlib.pyplot as plt
 
-def main():
+def main(num_cores):
     recording, sorting_true = se.toy_example(duration=60 * 30, num_channels=16, num_units=32, sampling_frequency=30000, num_segments=1, seed=0)
 
     timer = time.time()
@@ -26,7 +29,8 @@ def main():
             phase1_detect_channel_radius=150,
             detect_channel_radius=50,
             training_duration_sec=60
-        )
+        ),
+        num_cores=num_cores
     )
     
     elapsed_sec = time.time() - timer
@@ -56,4 +60,30 @@ def main():
         generate_visualization_output(rec=rec, recording_preprocessed=recording_preprocessed, sorting=sorting, sorting_true=sorting_true)
 
 if __name__ == '__main__':
-    main()
+    num_trials = 5
+    max_cores = os.cpu_count()
+    core_values = [1] + list(range(2, max_cores - 1, 2))
+    all_times = []
+
+    for num_cores in core_values:
+        times_for_this_core = []
+        for trial in range(num_trials):
+            start_time = time.time()
+            main(num_cores)  # Assuming your main function takes the number of cores as an argument
+            end_time = time.time()
+            elapsed_time = end_time - start_time
+            times_for_this_core.append(elapsed_time)
+        all_times.append(times_for_this_core)
+
+    # Convert to numpy array for easier calculations
+    all_times = np.array(all_times)
+    mean_times = np.mean(all_times, axis=1)
+    std_times = np.std(all_times, axis=1)
+
+    plt.plot(core_values, mean_times, label="Mean Execution Time")
+    plt.fill_between(core_values, mean_times - std_times, mean_times + std_times, color='gray', alpha=0.5, label="1 Std Deviation")
+    plt.xlabel("Number of Cores")
+    plt.ylabel("Execution Time (seconds)")
+    plt.title("Execution Time vs. Number of Cores")
+    plt.legend()
+    plt.show()
